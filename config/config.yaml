@@ -1,0 +1,52 @@
+project:
+  name: ddos-campus-lab
+
+# All addresses and interfaces below belong only to Mininet namespaces and
+# virtual links. The edge link has no upstream connection and no NAT is enabled.
+topology:
+  interface_prefix: dcl
+  nodes:
+    core_switch: dclCore
+    campus_router: dclRtr
+    edge: dclEdge
+  vlans:
+    10:
+      name: server_dmz
+      subnet: 10.10.10.0/24
+      gateway: 10.10.10.1
+    20:
+      name: faculty_admin
+      subnet: 10.10.20.0/24
+      gateway: 10.10.20.1
+    30:
+      name: student_lab
+      subnet: 10.10.30.0/24
+      gateway: 10.10.30.1
+  hosts:
+    student:
+      node: dclStudent
+      ip: 10.10.30.10
+      vlan: 30
+    faculty:
+      node: dclFaculty
+      ip: 10.10.20.10
+      vlan: 20
+    legitimate_client:
+      node: dclLegit
+      ip: 10.10.30.20
+      vlan: 30
+    attack:
+      node: dclAttack
+      ip: 10.10.30.30
+      vlan: 30
+    web_server:
+      node: dclWeb
+      ip: 10.10.10.100
+      vlan: 10
+  edge_transit:
+    subnet: 172.16.1.0/30
+    router_ip: 172.16.1.1
+    edge_ip: 172.16.1.2
+  http:
+    port: 80
+    response: Campus Mininet web server is online.
