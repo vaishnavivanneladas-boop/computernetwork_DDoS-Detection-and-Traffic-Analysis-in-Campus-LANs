@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -18,6 +19,32 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+try:
+    from system_monitor import (
+        DEFAULT_RESULTS_ROOT,
+        METRIC_FIELDS,
+        MonitorError as ExperimentMonitorError,
+        append_metric_records,
+        experiment_directory,
+        make_metric_record,
+        validate_experiment_id,
+        validate_experiment_metadata,
+        validate_scenario,
+    )
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from system_monitor import (
+        DEFAULT_RESULTS_ROOT,
+        METRIC_FIELDS,
+        MonitorError as ExperimentMonitorError,
+        append_metric_records,
+        experiment_directory,
+        make_metric_record,
+        validate_experiment_id,
+        validate_experiment_metadata,
+        validate_scenario,
+    )
+
 
 DMZ_SERVER_IP = "10.10.10.100"
 HTTP_PORT = 80
@@ -25,7 +52,7 @@ DEFAULT_ROOT_RESPONSE = "Campus Mininet web server is online."
 FLUSH_EVERY_REQUESTS = 32
 
 
-class MonitorError(RuntimeError):
+class MonitorError(ExperimentMonitorError):
     """Invalid monitor input or an HTTP health-check failure."""
 
 
@@ -33,33 +60,58 @@ class RequestCounters:
     def __init__(self) -> None:
         self.total_requests = 0
         self.successful_requests = 0
+        self.response_time_total_ms = 0.0
 
-    def record(self, successful: bool) -> None:
+    def record(self, successful: bool, response_time_ms: float) -> None:
         self.total_requests += 1
+        self.response_time_total_ms += response_time_ms
         if successful:
             self.successful_requests += 1
 
-    def snapshot(self) -> dict[str, int | float]:
+    def snapshot(self) -> dict[str, int | float | None]:
         total = self.total_requests
         successful = self.successful_requests
         return {
             "total_requests": total,
             "successful_requests": successful,
             "failed_requests": total - successful,
-            "http_completion_percentage": round(successful * 100 / total, 3) if total else 0.0,
+            "http_completion_percentage": round(successful * 100 / total, 3) if total else None,
+            "average_response_time_ms": round(self.response_time_total_ms / total, 3) if total else None,
         }
 
 
-class JsonlRequestLog:
-    """Buffer compact raw records and flush periodically to limit measurement overhead."""
+class CsvRequestLog:
+    """Buffer per-request metric rows using the shared experiment CSV schema."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, experiment_id: str, scenario: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.stream = path.open("a", encoding="utf-8", buffering=65536)
+        self.stream = path.open("x", newline="", encoding="utf-8", buffering=65536)
+        self.writer = csv.DictWriter(self.stream, fieldnames=METRIC_FIELDS, extrasaction="raise")
+        self.writer.writeheader()
+        self.stream.flush()
+        self.experiment_id = experiment_id
+        self.scenario = scenario
         self.pending = 0
 
-    def write(self, record: dict[str, Any]) -> None:
-        self.stream.write(json.dumps(record, separators=(",", ":"), ensure_ascii=True) + "\n")
+    def write_request(self, timestamp: str, request_id: str, metrics: list[tuple[str, Any, str]]) -> None:
+        rows = []
+        for metric_name, value, unit in metrics:
+            record = make_metric_record(
+                self.experiment_id,
+                self.scenario,
+                metric_name,
+                value,
+                unit,
+                timestamp=timestamp,
+                request_id=request_id,
+            )
+            rows.append({
+                field: "null" if record[field] is None else
+                "true" if record[field] is True else
+                "false" if record[field] is False else str(record[field])
+                for field in METRIC_FIELDS
+            })
+        self.writer.writerows(rows)
         self.pending += 1
         if self.pending >= FLUSH_EVERY_REQUESTS:
             self.flush()
@@ -134,8 +186,24 @@ class CampusRequestHandler(BaseHTTPRequestHandler):
             }
             if error_name is not None:
                 record["write_error"] = error_name
-            self.server.request_counters.record(successful)
-            self.server.request_log.write(record)
+            self.server.request_counters.record(successful, response_time_ms)
+            counters = self.server.request_counters.snapshot()
+            request_id = f"{os.getpid()}-{counters['total_requests']}"
+            self.server.request_log.write_request(
+                timestamp,
+                request_id,
+                [
+                    ("http_request_total", 1, "request"),
+                    ("http_status_code", status, "HTTP status"),
+                    ("http_response_time_ms", response_time_ms, "ms"),
+                    ("http_request_success", int(successful), "boolean"),
+                    ("http_total_requests", counters["total_requests"], "requests"),
+                    ("http_successful_requests", counters["successful_requests"], "requests"),
+                    ("http_failed_requests", counters["failed_requests"], "requests"),
+                    ("http_completion_percentage", counters["http_completion_percentage"], "%"),
+                    ("http_average_response_time_ms", counters["average_response_time_ms"], "ms"),
+                ],
+            )
             self.close_connection = True
 
     def _response(self, path: str, method_allowed: bool) -> tuple[int, str, bytes]:
@@ -209,75 +277,138 @@ def check_health(url: str, timeout: float = 2.0) -> dict[str, Any]:
     return {"status": "ok", "http_status": status, "url": url}
 
 
-def summarize_records(lines: Iterable[str]) -> dict[str, int | float | None]:
-    total = 0
-    successful = 0
-    response_time_total = 0.0
-
-    for line_number, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise MonitorError(f"Invalid JSON in request log line {line_number}: {error.msg}.") from error
-        if not isinstance(record, dict):
-            raise MonitorError(f"Request log line {line_number} must contain a JSON object.")
-
-        timestamp = record.get("timestamp")
-        status = record.get("status")
-        response_time_ms = record.get("response_time_ms")
-        completed = record.get("completed")
-        if not isinstance(timestamp, str):
-            raise MonitorError(f"Request log line {line_number} has no timestamp.")
-        try:
-            parsed_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        except ValueError as error:
-            raise MonitorError(f"Request log line {line_number} has an invalid timestamp.") from error
-        if parsed_timestamp.tzinfo is None:
-            raise MonitorError(f"Request log line {line_number} timestamp is missing its timezone.")
-        if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
-            raise MonitorError(f"Request log line {line_number} has an invalid HTTP status.")
-        if isinstance(response_time_ms, bool) or not isinstance(response_time_ms, (int, float)):
-            raise MonitorError(f"Request log line {line_number} has an invalid response time.")
-        if not math.isfinite(response_time_ms) or response_time_ms < 0:
-            raise MonitorError(f"Request log line {line_number} has a non-finite or negative response time.")
-        if not isinstance(completed, bool):
-            raise MonitorError(f"Request log line {line_number} has no completion flag.")
-
-        request_successful = completed and 200 <= status < 300
-        if "successful" in record and record["successful"] is not request_successful:
-            raise MonitorError(f"Request log line {line_number} has an inconsistent success flag.")
-        total += 1
-        successful += int(request_successful)
-        response_time_total += response_time_ms
-
-    failed = total - successful
-    return {
-        "total_requests": total,
-        "successful_requests": successful,
-        "failed_requests": failed,
-        "http_completion_percentage": round(successful * 100 / total, 3) if total else None,
-        "average_response_time_ms": round(response_time_total / total, 3) if total else None,
-    }
-
-
-def summarize_log(path: Path) -> dict[str, int | float | None]:
+def summarize_log(
+    path: Path,
+    experiment_id: str,
+    scenario: str,
+    results_root: Path = DEFAULT_RESULTS_ROOT,
+) -> dict[str, int | float | None]:
+    validate_experiment_id(experiment_id)
+    validate_scenario(scenario)
     try:
         with path.open(encoding="utf-8") as request_log:
-            return summarize_records(request_log)
+            reader = csv.DictReader(request_log)
+            if tuple(reader.fieldnames or ()) != METRIC_FIELDS:
+                raise MonitorError(f"Unexpected HTTP raw CSV header in {path}.")
+            requests: dict[str, dict[str, Any]] = {}
+            for line_number, row in enumerate(reader, start=2):
+                if row["experiment_id"] != experiment_id or row["scenario"] != scenario:
+                    raise MonitorError(f"HTTP raw CSV row {line_number} belongs to another experiment or scenario.")
+                request_id = row["request_id"]
+                if not request_id:
+                    raise MonitorError(f"HTTP raw CSV row {line_number} has no request ID.")
+                try:
+                    timestamp = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
+                except ValueError as error:
+                    raise MonitorError(f"HTTP raw CSV row {line_number} has an invalid timestamp.") from error
+                if timestamp.tzinfo is None:
+                    raise MonitorError(f"HTTP raw CSV row {line_number} has a timezone-free timestamp.")
+
+                request = requests.setdefault(request_id, {"seen": set()})
+                metric_name = row["metric_name"]
+                if metric_name in request["seen"]:
+                    raise MonitorError(f"HTTP raw CSV row {line_number} duplicates metric {metric_name}.")
+                request["seen"].add(metric_name)
+                value = row["value"]
+                if metric_name in ("http_request_total", "http_request_success"):
+                    if value not in ("0", "1"):
+                        raise MonitorError(f"HTTP raw CSV row {line_number} has an invalid request flag.")
+                    request[metric_name] = int(value)
+                elif metric_name == "http_status_code":
+                    try:
+                        status = int(value)
+                    except ValueError as error:
+                        raise MonitorError(f"HTTP raw CSV row {line_number} has an invalid HTTP status.") from error
+                    if not 100 <= status <= 599:
+                        raise MonitorError(f"HTTP raw CSV row {line_number} has an invalid HTTP status.")
+                    request["status"] = status
+                elif metric_name == "http_response_time_ms":
+                    try:
+                        response_time = float(value)
+                    except ValueError as error:
+                        raise MonitorError(f"HTTP raw CSV row {line_number} has an invalid response time.") from error
+                    if not math.isfinite(response_time) or response_time < 0:
+                        raise MonitorError(f"HTTP raw CSV row {line_number} has an invalid response time.")
+                    request["response_time_ms"] = response_time
+
+            successful = 0
+            response_time_total = 0.0
+            measured_response_times = 0
+            for request_id, request in requests.items():
+                required_metrics = {
+                    "http_request_total",
+                    "http_request_success",
+                    "http_status_code",
+                    "http_response_time_ms",
+                }
+                missing_metrics = required_metrics - request["seen"]
+                if missing_metrics:
+                    raise MonitorError(
+                        f"HTTP request {request_id} is missing metric(s): {', '.join(sorted(missing_metrics))}."
+                    )
+                if request.get("http_request_total") != 1:
+                    raise MonitorError(f"HTTP request {request_id} has no valid total-request measurement.")
+                is_successful = request.get("http_request_success") == 1
+                status = request.get("status")
+                if status is None or (is_successful and not 200 <= status < 300):
+                    raise MonitorError(f"HTTP request {request_id} has no actual or consistent HTTP status.")
+                if is_successful != (200 <= status < 300 and request.get("http_request_success") == 1):
+                    raise MonitorError(f"HTTP request {request_id} success flag conflicts with its HTTP status.")
+                successful += int(is_successful)
+                response_time = request.get("response_time_ms")
+                if response_time is not None:
+                    response_time_total += response_time
+                    measured_response_times += 1
+
+            total = len(requests)
+            summary = {
+                "total_requests": total,
+                "successful_requests": successful,
+                "failed_requests": total - successful,
+                "http_completion_percentage": round(successful * 100 / total, 3) if total else None,
+                "average_response_time_ms": round(response_time_total / measured_response_times, 3)
+                if measured_response_times
+                else None,
+            }
+            timestamp = utc_timestamp()
+            records = [
+                make_metric_record(experiment_id, scenario, "http_total_requests", total, "requests", timestamp=timestamp),
+                make_metric_record(experiment_id, scenario, "http_successful_requests", successful, "requests", timestamp=timestamp),
+                make_metric_record(experiment_id, scenario, "http_failed_requests", total - successful, "requests", timestamp=timestamp),
+                make_metric_record(experiment_id, scenario, "http_completion_percentage", summary["http_completion_percentage"], "%", timestamp=timestamp),
+                make_metric_record(experiment_id, scenario, "http_average_response_time_ms", summary["average_response_time_ms"], "ms", timestamp=timestamp),
+            ]
+            append_metric_records(experiment_id, scenario, records, results_root=results_root, stage="processed")
+            return summary
     except OSError as error:
         raise MonitorError(f"Cannot read HTTP request log {path}: {error}") from error
 
 
-def serve(log_path: Path, host_netns_inode: int, bind: str, port: int, root_response: str) -> None:
+def serve(
+    experiment_id: str,
+    scenario: str,
+    results_root: Path,
+    host_netns_inode: int,
+    bind: str,
+    port: int,
+    root_response: str,
+) -> None:
     if bind != DMZ_SERVER_IP or port != HTTP_PORT:
         raise MonitorError(f"The service may bind only to {DMZ_SERVER_IP}:{HTTP_PORT} inside Mininet.")
-    current_netns_inode = os.stat("/proc/self/ns/net").st_ino
-    if current_netns_inode == host_netns_inode:
+    validate_experiment_id(experiment_id)
+    validate_scenario(scenario)
+    directory = experiment_directory(experiment_id, results_root)
+    validate_experiment_metadata(directory, experiment_id, scenario)
+    request_log_path = directory / "raw" / "http_requests.csv"
+    try:
+        current_netns_inode = os.stat("/proc/self/ns/net").st_ino
+        actual_host_netns_inode = os.stat("/proc/1/ns/net").st_ino
+    except OSError as error:
+        raise MonitorError(f"Cannot verify DMZ network namespace identity: {error}") from error
+    if current_netns_inode == actual_host_netns_inode or current_netns_inode == host_netns_inode:
         raise MonitorError("Refusing to expose the DMZ service in the host network namespace.")
 
-    request_log = JsonlRequestLog(log_path)
+    request_log = CsvRequestLog(request_log_path, experiment_id, scenario)
     try:
         server = HTTPServer((bind, port), CampusRequestHandler)
     except OSError as error:
@@ -295,7 +426,7 @@ def serve(log_path: Path, host_netns_inode: int, bind: str, port: int, root_resp
 
     previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
     previous_sigint = signal.signal(signal.SIGINT, request_stop)
-    print(f"HTTP service listening on {bind}:{port}; request log: {log_path}", flush=True)
+    print(f"HTTP service listening on {bind}:{port}; request log: {request_log_path}", flush=True)
     try:
         while not stop_requested:
             server.handle_request()
@@ -311,7 +442,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     serve_parser = commands.add_parser("serve", help="run the isolated DMZ HTTP service")
-    serve_parser.add_argument("--log-file", required=True, type=Path)
+    serve_parser.add_argument("--experiment-id", required=True)
+    serve_parser.add_argument("--scenario", required=True)
+    serve_parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     serve_parser.add_argument("--host-netns-inode", required=True, type=int)
     serve_parser.add_argument("--bind", default=DMZ_SERVER_IP)
     serve_parser.add_argument("--port", default=HTTP_PORT, type=int)
@@ -321,8 +454,11 @@ def build_parser() -> argparse.ArgumentParser:
     health_parser.add_argument("--url", default=f"http://{DMZ_SERVER_IP}/health")
     health_parser.add_argument("--timeout", default=2.0, type=float)
 
-    summary_parser = commands.add_parser("summarize", help="calculate metrics from a raw JSONL request log")
+    summary_parser = commands.add_parser("summarize", help="calculate HTTP metrics from the raw request CSV")
+    summary_parser.add_argument("--experiment-id", required=True)
+    summary_parser.add_argument("--scenario", required=True)
     summary_parser.add_argument("--input", required=True, type=Path)
+    summary_parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     return parser
 
 
@@ -330,14 +466,28 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         if args.command == "serve":
-            serve(args.log_file, args.host_netns_inode, args.bind, args.port, args.root_response)
+            serve(
+                args.experiment_id,
+                args.scenario,
+                args.results_root,
+                args.host_netns_inode,
+                args.bind,
+                args.port,
+                args.root_response,
+            )
         elif args.command == "health":
             result = check_health(args.url, args.timeout)
             print(f"HTTP health check passed: {result['url']} returned HTTP {result['http_status']}.")
         else:
-            print(json.dumps(summarize_log(args.input), indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    summarize_log(args.input, args.experiment_id, args.scenario, args.results_root),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
         return 0
-    except (MonitorError, OSError) as error:
+    except (MonitorError, ExperimentMonitorError, OSError) as error:
         print(f"ERROR: {error}", file=sys.stderr, flush=True)
         return 1
 

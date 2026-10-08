@@ -65,6 +65,19 @@ def experiment_directory(
     return directory
 
 
+def validate_experiment_metadata(directory: Path, experiment_id: str, scenario: str) -> None:
+    manifest_path = directory / "logs" / "experiment.json"
+    try:
+        with manifest_path.open(encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise MonitorError(f"Cannot validate experiment manifest {manifest_path}: {error}") from error
+    if manifest.get("experiment_id") != experiment_id or manifest.get("scenario") != scenario:
+        raise MonitorError(
+            f"Experiment manifest does not match requested ID/scenario {experiment_id}/{scenario}."
+        )
+
+
 def create_experiment(
     scenario: str,
     experiment_id: str | None = None,
@@ -136,6 +149,10 @@ def make_metric_record(
         raise MonitorError("Metric name must be non-empty text.")
     if not isinstance(unit, str) or not unit:
         raise MonitorError("Metric unit must be non-empty text.")
+    if value is not None and not isinstance(value, (str, bool, int, float)):
+        raise MonitorError("Metric value must be a scalar or null.")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise MonitorError("Numeric metric values must be finite.")
     if value is None:
         status = "unavailable"
     elif status is None:
@@ -171,6 +188,7 @@ def append_metric_records(
     directory = experiment_directory(experiment_id, results_root)
     if not directory.is_dir():
         raise MonitorError(f"Experiment directory does not exist: {directory}")
+    validate_experiment_metadata(directory, experiment_id, scenario)
 
     output_path = directory / stage / "metrics.csv"
     normalized_rows: list[dict[str, str]] = []
@@ -255,6 +273,13 @@ def monitor_process(
     try:
         import psutil
     except ImportError as error:
+        timestamp = utc_timestamp()
+        append_metric_records(
+            experiment_id,
+            scenario,
+            unavailable_process_records(experiment_id, scenario, timestamp),
+            results_root=results_root,
+        )
         raise MonitorError("psutil is required for process measurements; install project requirements.") from error
 
     try:
@@ -298,7 +323,7 @@ def monitor_process(
                 )
                 append_metric_records(experiment_id, scenario, records, results_root=results_root)
                 print(f"[WARN] Server process {pid} stopped during monitoring; later resource metrics are unavailable.", flush=True)
-                return 1
+                return 0
             except psutil.AccessDenied:
                 records = unavailable_process_records(experiment_id, scenario, timestamp)
 

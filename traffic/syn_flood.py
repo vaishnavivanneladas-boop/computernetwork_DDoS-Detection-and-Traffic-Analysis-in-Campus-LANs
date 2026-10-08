@@ -91,6 +91,8 @@ def load_lab_config() -> dict[str, Any]:
         core_bridge = topology["nodes"]["core_switch"]
         attack_name = attack["node"]
         web_name = web_server["node"]
+        router_name = topology["nodes"]["campus_router"]
+        configured_host_names = tuple(host["node"] for host in hosts.values())
         interface_prefix = topology["interface_prefix"]
     except (KeyError, TypeError, ValueError) as error:
         raise SafetyError(f"Lab configuration is missing valid attack/DMZ topology details: {error}") from error
@@ -143,6 +145,8 @@ def load_lab_config() -> dict[str, Any]:
         "web_vlan": web_vlan,
         "attack_name": attack_name,
         "web_name": web_name,
+        "router_name": router_name,
+        "configured_host_names": configured_host_names,
         "core_bridge": core_bridge,
     }
 
@@ -253,6 +257,24 @@ def verify_ovs_access_port(host_name: str, expected_vlan: int, core_bridge: str)
     return port_name
 
 
+def verify_ovs_bridge_inventory(settings: dict[str, Any]) -> None:
+    bridge_ports = {
+        port.strip()
+        for port in run_command(
+            ["ovs-vsctl", "--timeout=3", "list-ports", settings["core_bridge"]],
+            f"Inspect OVS core bridge {settings['core_bridge']}",
+        ).stdout.splitlines()
+        if port.strip() and port.strip() != settings["core_bridge"]
+    }
+    expected_ports = {f"{host_name}-eth0" for host_name in settings["configured_host_names"]}
+    expected_ports.add(f"{settings['router_name']}-eth0")
+    if bridge_ports != expected_ports:
+        raise SafetyError(
+            "Refusing to run: OVS core ports differ from the isolated Mininet topology "
+            f"(unexpected={sorted(bridge_ports - expected_ports)}, missing={sorted(expected_ports - bridge_ports)})."
+        )
+
+
 def verify_attack_route(settings: dict[str, Any]) -> str:
     address_output = run_command(["ip", "-o", "-4", "address", "show"], "Inspect attack-host addresses")
     addresses = parse_interface_addresses(address_output.stdout)
@@ -335,6 +357,7 @@ def validate_lab_path(target: ipaddress.IPv4Address, settings: dict[str, Any]) -
     verify_not_host_namespace()
     verify_target_not_on_host(target)
     source_interface = verify_attack_route(settings)
+    verify_ovs_bridge_inventory(settings)
     attack_port = verify_ovs_access_port(settings["attack_name"], settings["attack_vlan"], settings["core_bridge"])
     if source_interface != attack_port:
         raise SafetyError(

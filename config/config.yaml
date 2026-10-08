@@ -50,3 +50,47 @@ topology:
   http:
     port: 80
     response: Campus Mininet web server is online.
+
+# These are experiment parameters for the isolated Mininet lab, not recommended
+# production thresholds or universally optimal values.
+rate_limit:
+  enabled: true
+  syn_rate: 5/second
+  burst: 10
+  destination_port: 80
+  experimental_parameter: true
+
+traffic:
+  legitimate_rate_requests_per_second: 30
+  legitimate_duration_seconds: 30
+  legitimate_timeout_seconds: 3
+  syn_packet_count: 50
+  syn_rate_packets_per_second: 5
+  syn_duration_seconds: 10
+  syn_packet_size_bytes: 64
+  experimental_parameters: true
+
+detection:
+  sustained_window_seconds: 10
+  sampling_interval_seconds: 1
+  required_consecutive_samples: 3
+  thresholds:
+    syn_rate_packets_per_second: 10
+    syn_ack_ratio: 3.0
+    cpu_utilization_percent: 70
+    memory_utilization_percent: 75
+    dropped_packets: 5
+    http_failure_percent: 10
+    http_response_time_ms: 1000
+  weights:
+    syn_rate_high: 2
+    handshake_imbalance: 2
+    cpu_high: 1
+    memory_high: 1
+    drops_high: 2
+    http_failure_high: 2
+    response_time_high: 1
+  risk_levels:
+    suspicious_minimum: 2
+    high_minimum: 4
+    critical_minimum: 7
